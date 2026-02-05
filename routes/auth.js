@@ -1,50 +1,57 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { get, insert, run } = require('../database/init');
+const { User } = require('../database/init');
 
 const router = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 
-// Register new user
+// Register
 router.post('/register', async (req, res) => {
     try {
         const { username, email, password } = req.body;
 
-        // Validate input
         if (!username || !email || !password) {
             return res.status(400).json({ error: 'All fields are required' });
         }
 
-        if (password.length < 6) {
-            return res.status(400).json({ error: 'Password must be at least 6 characters' });
-        }
+        // Check if user exists
+        const existingUser = await User.findOne({
+            $or: [{ email }, { username }]
+        });
 
-        // Check if user already exists
-        const existingUser = get('SELECT id FROM users WHERE email = ? OR username = ?', [email, username]);
         if (existingUser) {
-            return res.status(400).json({ error: 'User already exists with this email or username' });
+            if (existingUser.email === email) {
+                return res.status(400).json({ error: 'Email already registered' });
+            }
+            return res.status(400).json({ error: 'Username already taken' });
         }
 
         // Hash password
         const hashedPassword = await bcrypt.hash(password, 10);
 
-        // Insert user
-        const userId = insert(
-            'INSERT INTO users (username, email, password) VALUES (?, ?, ?)',
-            [username, email, hashedPassword]
-        );
+        // Create user
+        const user = new User({
+            username,
+            email,
+            password: hashedPassword
+        });
+
+        await user.save();
 
         // Generate token
-        const token = jwt.sign({ userId }, JWT_SECRET, { expiresIn: '7d' });
+        const token = jwt.sign({ userId: user._id }, JWT_SECRET, { expiresIn: '30d' });
 
         res.status(201).json({
             message: 'User registered successfully',
             token,
             user: {
-                id: userId,
-                username,
-                email
+                id: user._id,
+                username: user.username,
+                email: user.email,
+                avatar: user.avatar,
+                bio: user.bio,
+                profilePicture: user.profilePicture
             }
         });
     } catch (error) {
@@ -53,39 +60,40 @@ router.post('/register', async (req, res) => {
     }
 });
 
-// Login user
+// Login
 router.post('/login', async (req, res) => {
     try {
         const { email, password } = req.body;
 
-        // Validate input
         if (!email || !password) {
             return res.status(400).json({ error: 'Email and password are required' });
         }
 
         // Find user
-        const user = get('SELECT * FROM users WHERE email = ?', [email]);
+        const user = await User.findOne({ email });
         if (!user) {
-            return res.status(400).json({ error: 'Invalid credentials' });
+            return res.status(401).json({ error: 'Invalid credentials' });
         }
 
         // Check password
         const isMatch = await bcrypt.compare(password, user.password);
         if (!isMatch) {
-            return res.status(400).json({ error: 'Invalid credentials' });
+            return res.status(401).json({ error: 'Invalid credentials' });
         }
 
         // Generate token
-        const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
+        const token = jwt.sign({ userId: user._id }, JWT_SECRET, { expiresIn: '30d' });
 
         res.json({
             message: 'Login successful',
             token,
             user: {
-                id: user.id,
+                id: user._id,
                 username: user.username,
                 email: user.email,
-                avatar: user.avatar
+                avatar: user.avatar,
+                bio: user.bio,
+                profilePicture: user.profilePicture
             }
         });
     } catch (error) {
@@ -94,8 +102,8 @@ router.post('/login', async (req, res) => {
     }
 });
 
-// Get current user (protected route)
-router.get('/me', (req, res) => {
+// Get current user
+router.get('/me', async (req, res) => {
     try {
         const token = req.headers.authorization?.split(' ')[1];
         if (!token) {
@@ -103,15 +111,24 @@ router.get('/me', (req, res) => {
         }
 
         const decoded = jwt.verify(token, JWT_SECRET);
-        const user = get('SELECT id, username, email, avatar, online FROM users WHERE id = ?', [decoded.userId]);
+        const user = await User.findById(decoded.userId).select('-password');
 
         if (!user) {
             return res.status(404).json({ error: 'User not found' });
         }
 
-        res.json({ user });
+        res.json({
+            user: {
+                id: user._id,
+                username: user.username,
+                email: user.email,
+                avatar: user.avatar,
+                bio: user.bio,
+                profilePicture: user.profilePicture
+            }
+        });
     } catch (error) {
-        console.error('Auth error:', error);
+        console.error('Get me error:', error);
         res.status(401).json({ error: 'Invalid token' });
     }
 });

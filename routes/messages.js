@@ -1,12 +1,12 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
-const { get, all, insert, run } = require('../database/init');
+const { Message } = require('../database/init');
 
 const router = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 
 // Middleware to verify token
-const authenticate = (req, res, next) => {
+const authenticate = async (req, res, next) => {
     try {
         const token = req.headers.authorization?.split(' ')[1];
         if (!token) {
@@ -20,64 +20,108 @@ const authenticate = (req, res, next) => {
     }
 };
 
-// Get messages with a specific user
-router.get('/:userId', authenticate, (req, res) => {
+// Get messages between two users
+router.get('/:userId', authenticate, async (req, res) => {
     try {
-        const otherUserId = parseInt(req.params.userId);
-        const limit = parseInt(req.query.limit) || 50;
+        const otherUserId = req.params.userId;
 
-        const messages = all(`
-      SELECT m.*, 
-        sender.username as senderUsername,
-        receiver.username as receiverUsername
-      FROM messages m
-      JOIN users sender ON m.sender_id = sender.id
-      JOIN users receiver ON m.receiver_id = receiver.id
-      WHERE (m.sender_id = ? AND m.receiver_id = ?)
-         OR (m.sender_id = ? AND m.receiver_id = ?)
-      ORDER BY m.timestamp DESC
-      LIMIT ?
-    `, [req.userId, otherUserId, otherUserId, req.userId, limit]);
+        const messages = await Message.find({
+            $or: [
+                { senderId: req.userId, receiverId: otherUserId },
+                { senderId: otherUserId, receiverId: req.userId }
+            ]
+        })
+            .sort({ timestamp: 1 })
+            .limit(100);
 
-        // Mark messages as read
-        run(`
-      UPDATE messages 
-      SET read = 1 
-      WHERE sender_id = ? AND receiver_id = ? AND read = 0
-    `, [otherUserId, req.userId]);
-
-        res.json({ messages: messages.reverse() });
+        res.json({
+            messages: messages.map(m => ({
+                id: m._id,
+                sender_id: m.senderId,
+                receiver_id: m.receiverId,
+                content: m.content,
+                timestamp: m.timestamp,
+                status: m.status
+            }))
+        });
     } catch (error) {
         console.error('Get messages error:', error);
         res.status(500).json({ error: 'Server error' });
     }
 });
 
-// Send a message (REST fallback, primarily use Socket.io)
-router.post('/send', authenticate, (req, res) => {
+// Send message (REST fallback)
+router.post('/send', authenticate, async (req, res) => {
     try {
         const { receiverId, content } = req.body;
 
         if (!receiverId || !content) {
-            return res.status(400).json({ error: 'Receiver and content are required' });
+            return res.status(400).json({ error: 'Receiver and content required' });
         }
 
-        // Check if receiver exists
-        const receiver = get('SELECT id FROM users WHERE id = ?', [receiverId]);
-        if (!receiver) {
-            return res.status(404).json({ error: 'Receiver not found' });
-        }
+        const message = new Message({
+            senderId: req.userId,
+            receiverId,
+            content,
+            status: 'sent'
+        });
 
-        const messageId = insert(`
-      INSERT INTO messages (sender_id, receiver_id, content)
-      VALUES (?, ?, ?)
-    `, [req.userId, receiverId, content]);
+        await message.save();
 
-        const message = get('SELECT * FROM messages WHERE id = ?', [messageId]);
-
-        res.status(201).json({ message });
+        res.json({
+            message: {
+                id: message._id,
+                sender_id: message.senderId,
+                receiver_id: message.receiverId,
+                content: message.content,
+                timestamp: message.timestamp,
+                status: message.status
+            }
+        });
     } catch (error) {
         console.error('Send message error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Mark messages as delivered
+router.post('/delivered', authenticate, async (req, res) => {
+    try {
+        const { senderId } = req.body;
+
+        await Message.updateMany(
+            {
+                senderId,
+                receiverId: req.userId,
+                status: 'sent'
+            },
+            { status: 'delivered' }
+        );
+
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Mark delivered error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Mark messages as seen
+router.post('/seen', authenticate, async (req, res) => {
+    try {
+        const { senderId } = req.body;
+
+        await Message.updateMany(
+            {
+                senderId,
+                receiverId: req.userId,
+                status: { $in: ['sent', 'delivered'] }
+            },
+            { status: 'seen' }
+        );
+
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Mark seen error:', error);
         res.status(500).json({ error: 'Server error' });
     }
 });

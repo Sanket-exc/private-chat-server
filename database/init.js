@@ -1,119 +1,83 @@
-const initSqlJs = require('sql.js');
-const fs = require('fs');
-const path = require('path');
+const mongoose = require('mongoose');
 
-const DB_PATH = path.join(__dirname, '..', 'chat.db');
+// User Schema
+const userSchema = new mongoose.Schema({
+    username: { type: String, required: true, unique: true },
+    email: { type: String, required: true, unique: true },
+    password: { type: String, required: true },
+    avatar: { type: String, default: '' },
+    bio: { type: String, default: '' },
+    profilePicture: { type: String, default: '' },
+    online: { type: Boolean, default: false },
+    publicKey: { type: String, default: '' },
+    fcmToken: { type: String, default: '' },
+    lastSeen: { type: Date, default: Date.now },
+    createdAt: { type: Date, default: Date.now }
+});
 
-let db = null;
+// Message Schema with delivery status
+const messageSchema = new mongoose.Schema({
+    senderId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    receiverId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    content: { type: String, required: true },
+    status: {
+        type: String,
+        enum: ['sent', 'delivered', 'seen'],
+        default: 'sent'
+    },
+    timestamp: { type: Date, default: Date.now }
+});
 
-// Initialize database
-async function initDatabase() {
-    const SQL = await initSqlJs();
+// Group Schema
+const groupSchema = new mongoose.Schema({
+    name: { type: String, required: true },
+    description: { type: String, default: '' },
+    avatar: { type: String, default: '' },
+    creatorId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    members: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+    admins: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+    createdAt: { type: Date, default: Date.now }
+});
 
-    // Load existing database or create new one
+// Group Message Schema
+const groupMessageSchema = new mongoose.Schema({
+    groupId: { type: mongoose.Schema.Types.ObjectId, ref: 'Group', required: true },
+    senderId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    content: { type: String, required: true },
+    timestamp: { type: Date, default: Date.now }
+});
+
+// Create indexes for better performance
+messageSchema.index({ senderId: 1, receiverId: 1 });
+messageSchema.index({ timestamp: -1 });
+groupMessageSchema.index({ groupId: 1, timestamp: -1 });
+
+// Models
+const User = mongoose.model('User', userSchema);
+const Message = mongoose.model('Message', messageSchema);
+const Group = mongoose.model('Group', groupSchema);
+const GroupMessage = mongoose.model('GroupMessage', groupMessageSchema);
+
+// Connect to MongoDB
+async function connectDB() {
     try {
-        if (fs.existsSync(DB_PATH)) {
-            const buffer = fs.readFileSync(DB_PATH);
-            db = new SQL.Database(buffer);
-            console.log('✅ Loaded existing database');
-        } else {
-            db = new SQL.Database();
-            console.log('✅ Created new database');
+        const mongoUri = process.env.MONGODB_URI;
+        if (!mongoUri) {
+            throw new Error('MONGODB_URI environment variable not set');
         }
+
+        await mongoose.connect(mongoUri);
+        console.log('✅ Connected to MongoDB Atlas');
     } catch (error) {
-        db = new SQL.Database();
-        console.log('✅ Created new database (fresh start)');
-    }
-
-    // Create tables
-    db.run(`
-    CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      username TEXT UNIQUE NOT NULL,
-      email TEXT UNIQUE NOT NULL,
-      password TEXT NOT NULL,
-      avatar TEXT DEFAULT '',
-      online INTEGER DEFAULT 0,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-
-    db.run(`
-    CREATE TABLE IF NOT EXISTS messages (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      sender_id INTEGER NOT NULL,
-      receiver_id INTEGER NOT NULL,
-      content TEXT NOT NULL,
-      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-      read INTEGER DEFAULT 0,
-      FOREIGN KEY (sender_id) REFERENCES users(id),
-      FOREIGN KEY (receiver_id) REFERENCES users(id)
-    )
-  `);
-
-    // Create indexes
-    db.run(`CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id)`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_messages_receiver ON messages(receiver_id)`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)`);
-
-    // Save database
-    saveDatabase();
-
-    console.log('✅ Database tables initialized');
-    return db;
-}
-
-// Save database to file
-function saveDatabase() {
-    if (db) {
-        const data = db.export();
-        const buffer = Buffer.from(data);
-        fs.writeFileSync(DB_PATH, buffer);
+        console.error('❌ MongoDB connection error:', error.message);
+        process.exit(1);
     }
 }
 
-// Get database instance
-function getDb() {
-    return db;
-}
-
-// Helper to run queries that don't return results
-function run(sql, params = []) {
-    db.run(sql, params);
-    saveDatabase();
-}
-
-// Helper to get one row
-function get(sql, params = []) {
-    const stmt = db.prepare(sql);
-    stmt.bind(params);
-    if (stmt.step()) {
-        const row = stmt.getAsObject();
-        stmt.free();
-        return row;
-    }
-    stmt.free();
-    return null;
-}
-
-// Helper to get all rows
-function all(sql, params = []) {
-    const stmt = db.prepare(sql);
-    stmt.bind(params);
-    const results = [];
-    while (stmt.step()) {
-        results.push(stmt.getAsObject());
-    }
-    stmt.free();
-    return results;
-}
-
-// Helper to insert and get last insert id
-function insert(sql, params = []) {
-    db.run(sql, params);
-    const result = db.exec("SELECT last_insert_rowid() as id");
-    saveDatabase();
-    return result[0]?.values[0]?.[0] || null;
-}
-
-module.exports = { initDatabase, getDb, run, get, all, insert, saveDatabase };
+module.exports = {
+    connectDB,
+    User,
+    Message,
+    Group,
+    GroupMessage
+};

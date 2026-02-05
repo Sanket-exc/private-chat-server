@@ -1,7 +1,7 @@
 {
     "name": "chat-server",
-    "version": "1.0.0",
-    "description": "Private messaging backend with SQLite and Socket.io",
+    "version": "2.0.0",
+    "description": "Private messaging backend with MongoDB and Socket.io",
     "main": "index.js",
     "scripts": {
         "start": "node index.js",
@@ -13,8 +13,8 @@
         "dotenv": "^16.4.1",
         "express": "^4.18.2",
         "jsonwebtoken": "^9.0.2",
-        "socket.io": "^4.7.4",
-        "sql.js": "^1.10.0"
+        "mongoose": "^8.1.0",
+        "socket.io": "^4.7.4"
     },
     "devDependencies": {
         "nodemon": "^3.0.3"

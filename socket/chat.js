@@ -1,117 +1,145 @@
 const jwt = require('jsonwebtoken');
-const { get, insert, run } = require('../database/init');
+const { User, Message } = require('../database/init');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 
-// Store online users: { odId: socketId }
-const onlineUsers = new Map();
+// Track connected users: { odID: {socketId, ...} }
+const connectedUsers = new Map();
 
-function initializeSocket(io) {
-    // Middleware to authenticate socket connections
-    io.use((socket, next) => {
-        const token = socket.handshake.auth.token;
-        if (!token) {
-            return next(new Error('Authentication error'));
-        }
-
+function setupSocket(io) {
+    // Verify token on connection
+    io.use(async (socket, next) => {
         try {
+            const token = socket.handshake.auth.token;
+            if (!token) {
+                return next(new Error('Authentication required'));
+            }
+
             const decoded = jwt.verify(token, JWT_SECRET);
             socket.userId = decoded.userId;
             next();
         } catch (error) {
-            next(new Error('Authentication error'));
+            next(new Error('Invalid token'));
         }
     });
 
-    io.on('connection', (socket) => {
-        console.log(`User ${socket.userId} connected`);
+    io.on('connection', async (socket) => {
+        const userId = socket.userId;
+        console.log(`✅ User connected: ${userId}`);
 
-        // Store user's socket and mark online
-        onlineUsers.set(socket.userId, socket.id);
-        run('UPDATE users SET online = 1 WHERE id = ?', [socket.userId]);
+        // Add to connected users
+        connectedUsers.set(userId, { socketId: socket.id });
 
-        // Notify other users that this user is online
-        socket.broadcast.emit('user_online', { userId: socket.userId });
+        // Update online status
+        await User.findByIdAndUpdate(userId, { online: true, lastSeen: new Date() });
 
-        // Join a room for private messaging
-        socket.join(`user_${socket.userId}`);
+        // Notify others that user is online
+        socket.broadcast.emit('user_online', { userId });
 
-        // Handle sending messages
-        socket.on('send_message', (data) => {
+        // Mark messages as delivered for this user
+        await Message.updateMany(
+            { receiverId: userId, status: 'sent' },
+            { status: 'delivered' }
+        );
+
+        // Send message
+        socket.on('send_message', async (data) => {
             try {
                 const { receiverId, content } = data;
 
-                if (!receiverId || !content) {
-                    socket.emit('error', { message: 'Invalid message data' });
-                    return;
-                }
-
                 // Save message to database
-                const messageId = insert(`
-          INSERT INTO messages (sender_id, receiver_id, content)
-          VALUES (?, ?, ?)
-        `, [socket.userId, receiverId, content]);
+                const message = new Message({
+                    senderId: userId,
+                    receiverId,
+                    content,
+                    status: 'sent'
+                });
+                await message.save();
 
-                const message = get(`
-          SELECT m.*, u.username as senderUsername
-          FROM messages m
-          JOIN users u ON m.sender_id = u.id
-          WHERE m.id = ?
-        `, [messageId]);
+                const messageData = {
+                    id: message._id,
+                    sender_id: userId,
+                    receiver_id: receiverId,
+                    content,
+                    timestamp: message.timestamp,
+                    status: 'sent'
+                };
 
-                // Send to receiver if online
-                const receiverSocketId = onlineUsers.get(receiverId);
-                if (receiverSocketId) {
-                    io.to(receiverSocketId).emit('receive_message', message);
+                // If receiver is online, mark as delivered and send
+                const receiverInfo = connectedUsers.get(receiverId);
+                if (receiverInfo) {
+                    message.status = 'delivered';
+                    await message.save();
+                    messageData.status = 'delivered';
+
+                    io.to(receiverInfo.socketId).emit('receive_message', messageData);
+
+                    // Notify sender of delivery
+                    socket.emit('message_delivered', { messageId: message._id });
                 }
 
                 // Confirm to sender
-                socket.emit('message_sent', message);
+                socket.emit('message_sent', { ...messageData, status: message.status });
             } catch (error) {
                 console.error('Send message error:', error);
                 socket.emit('error', { message: 'Failed to send message' });
             }
         });
 
-        // Handle typing indicator
+        // Typing indicator
         socket.on('typing', (data) => {
             const { receiverId, isTyping } = data;
-            const receiverSocketId = onlineUsers.get(receiverId);
-            if (receiverSocketId) {
-                io.to(receiverSocketId).emit('user_typing', {
-                    userId: socket.userId,
+            const receiverInfo = connectedUsers.get(receiverId);
+            if (receiverInfo) {
+                io.to(receiverInfo.socketId).emit('user_typing', {
+                    userId,
                     isTyping
                 });
             }
         });
 
-        // Handle message read
-        socket.on('messages_read', (data) => {
-            const { senderId } = data;
+        // Mark messages as read/seen
+        socket.on('messages_read', async (data) => {
+            try {
+                const { senderId } = data;
 
-            run(`
-        UPDATE messages 
-        SET read = 1 
-        WHERE sender_id = ? AND receiver_id = ? AND read = 0
-      `, [senderId, socket.userId]);
+                // Update all messages from sender to this user as seen
+                const result = await Message.updateMany(
+                    {
+                        senderId,
+                        receiverId: userId,
+                        status: { $in: ['sent', 'delivered'] }
+                    },
+                    { status: 'seen' }
+                );
 
-            // Notify sender that messages were read
-            const senderSocketId = onlineUsers.get(senderId);
-            if (senderSocketId) {
-                io.to(senderSocketId).emit('messages_read_ack', {
-                    readerId: socket.userId
-                });
+                // Notify sender that messages were seen
+                const senderInfo = connectedUsers.get(senderId);
+                if (senderInfo && result.modifiedCount > 0) {
+                    io.to(senderInfo.socketId).emit('messages_seen', {
+                        byUserId: userId
+                    });
+                }
+            } catch (error) {
+                console.error('Messages read error:', error);
             }
         });
 
-        // Handle disconnect
-        socket.on('disconnect', () => {
-            console.log(`User ${socket.userId} disconnected`);
-            onlineUsers.delete(socket.userId);
-            run('UPDATE users SET online = 0 WHERE id = ?', [socket.userId]);
-            socket.broadcast.emit('user_offline', { userId: socket.userId });
+        // Disconnect
+        socket.on('disconnect', async () => {
+            console.log(`❌ User disconnected: ${userId}`);
+            connectedUsers.delete(userId);
+
+            // Update offline status
+            await User.findByIdAndUpdate(userId, {
+                online: false,
+                lastSeen: new Date()
+            });
+
+            // Notify others that user is offline
+            socket.broadcast.emit('user_offline', { userId });
         });
     });
 }
 
-module.exports = { initializeSocket, onlineUsers };
+module.exports = { setupSocket, connectedUsers };
