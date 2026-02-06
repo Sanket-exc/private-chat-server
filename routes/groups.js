@@ -155,6 +155,52 @@ router.get('/:id/messages', authenticate, async (req, res) => {
     }
 });
 
+// Send group message
+router.post('/:id/messages', authenticate, async (req, res) => {
+    try {
+        const { content } = req.body;
+        const groupId = req.params.id;
+
+        if (!content) {
+            return res.status(400).json({ error: 'Message content required' });
+        }
+
+        // Verify user is a member
+        const group = await Group.findById(groupId);
+        if (!group) {
+            return res.status(404).json({ error: 'Group not found' });
+        }
+        if (!group.members.some(m => m.toString() === req.userId)) {
+            return res.status(403).json({ error: 'Not a member of this group' });
+        }
+
+        // Get sender info
+        const sender = await User.findById(req.userId).select('username');
+
+        // Create message
+        const message = new GroupMessage({
+            groupId,
+            senderId: req.userId,
+            content
+        });
+        await message.save();
+
+        res.status(201).json({
+            message: {
+                id: message._id,
+                groupId,
+                senderId: req.userId,
+                senderUsername: sender.username,
+                content,
+                timestamp: message.timestamp
+            }
+        });
+    } catch (error) {
+        console.error('Send group message error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
 // Add members to group
 router.post('/:id/members', authenticate, async (req, res) => {
     try {
